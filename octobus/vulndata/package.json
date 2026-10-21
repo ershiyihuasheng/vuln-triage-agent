@@ -1,0 +1,16 @@
+{
+  "name": "vulndata",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "vulndata": "bin/vulndata.js"
+  },
+  "dependencies": {
+    "@chaitin-ai/octobus-sdk": "0.6.2"
+  },
+  "scripts": {
+    "validate": "octobus-sdk validate --strict",
+    "test": "node --test"
+  }
+}

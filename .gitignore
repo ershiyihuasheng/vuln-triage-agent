@@ -1,0 +1,10 @@
+# 密钥与本地配置：绝不入库
+.env
+*.env
+*.token
+# 运行数据
+snapshots/
+reports/
+node_modules/
+*.bak
+*.before-*

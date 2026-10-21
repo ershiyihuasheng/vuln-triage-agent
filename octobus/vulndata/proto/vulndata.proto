@@ -1,0 +1,150 @@
+syntax = "proto3";
+package vulndata.v1;
+
+// 漏洞快照只读查询服务：只返回快照里已有的数据，不做任何研判。
+// 所有方法都可以传 snapshot_id 固定快照，保证一次研判从头到尾读的是同一份数据；不传 = 最新的完整快照。
+service VulndataService {
+  // 快照概况：用哪份快照、多久了、镜像清单、宿主机内核、agent 驱动
+  rpc GetSummary(GetSummaryRequest) returns (GetSummaryResponse);
+  // 一个镜像里所有有漏洞的包（给确定性预研判脚本批量用）
+  rpc ListPackages(ListPackagesRequest) returns (ListPackagesResponse);
+  // 一个包的详细证据（给 LLM 按需查）
+  rpc GetPackageEvidence(GetPackageEvidenceRequest) returns (GetPackageEvidenceResponse);
+  // 一个漏洞的描述和评分（给 LLM 按需查）
+  rpc GetCVE(GetCVERequest) returns (GetCVEResponse);
+}
+
+message GetSummaryRequest {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+}
+
+message ImageInfo {
+  string short_id = 1 [json_name = "shortId"];
+  string image_id = 2 [json_name = "imageId"];
+  repeated string repo_tags = 3 [json_name = "repoTags"];
+  repeated string running_containers = 4 [json_name = "runningContainers"];
+  string user = 5;                       // 空 = 镜像未设置运行用户，Docker 默认 root
+  repeated string entrypoint = 6;
+  repeated string cmd = 7;
+  int32 vulnerable_packages = 8 [json_name = "vulnerablePackages"];
+  int32 vuln_records = 9 [json_name = "vulnRecords"];
+  int32 unique_vulns = 10 [json_name = "uniqueVulns"];
+}
+
+message AgentDriver {
+  string name = 1;
+  string image = 2;
+  string driver = 3;
+}
+
+message GetSummaryResponse {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string created_at = 2 [json_name = "createdAt"];
+  double age_hours = 3 [json_name = "ageHours"];
+  bool stale = 4;                        // age_hours > max_age_hours
+  double max_age_hours = 5 [json_name = "maxAgeHours"];
+  string trivy_version = 6 [json_name = "trivyVersion"];
+  string vuln_db_updated_at = 7 [json_name = "vulnDbUpdatedAt"];
+  repeated ImageInfo images = 8;
+  string host_kernel = 9 [json_name = "hostKernel"];
+  bool host_reboot_required = 10 [json_name = "hostRebootRequired"];
+  repeated AgentDriver agents = 11;
+  string agents_error = 12 [json_name = "agentsError"];   // 非空 = 驱动类型未知，依赖它的规则不能生效
+}
+
+message ListPackagesRequest {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string image_short_id = 2 [json_name = "imageShortId"];
+}
+
+message VulnBrief {
+  string id = 1;
+  string severity = 2;
+  string fixed = 3;                      // 空 = 尚无修复版本
+  string status = 4;
+}
+
+message PackageBrief {
+  string name = 1;
+  string installed = 2;
+  string target = 3;                     // Trivy 的扫描目标，系统包是 "xxx (debian 13.7)"，Go 程序是文件路径
+  string class = 4;                      // os-pkgs / lang-pkgs
+  string type = 5;                       // debian / gobinary / node-pkg ...
+  string pkg_path = 6 [json_name = "pkgPath"];
+  // 运行时使用情况（只代表采集那一刻）：
+  //   in_use              有运行中的进程加载了它的库、或正在运行它的可执行文件
+  //   not_observed        镜像有容器在运行，但采集时没看到使用 —— 不等于不可达
+  //   no_runtime_evidence 镜像没有容器在运行，没有运行时证据
+  //   not_tracked         这类包（如 node/python 依赖）无法用进程和库来对应，运行时证据不适用
+  string usage = 7;
+  repeated string used_via = 8 [json_name = "usedVia"];
+  repeated VulnBrief vulns = 9;
+  bool inert = 10;                       // 包内只有文档/头文件/静态库（白名单分类，规则 R4 用）；只对系统包有意义
+  FileSummary files = 11;                // 包内文件分类，只在 GetPackageEvidence 里返回
+}
+
+// 包里装了哪些文件（采集脚本用 docker create + docker cp 从镜像里读 dpkg 文件清单，镜像程序不会被执行）
+message FileSummary {
+  int32 files = 1;
+  map<string, int32> counts = 2;         // doc / header / static / shared_lib / executable / script / other
+  repeated string executables = 3;
+  repeated string shared_libs = 4 [json_name = "sharedLibs"];
+  repeated string scripts = 5;
+  repeated string other_sample = 6 [json_name = "otherSample"];
+  string note = 7;                       // 非空 = 没有文件清单（镜像无 dpkg、该包无清单等），原因写在这里
+}
+
+message ListPackagesResponse {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string image_short_id = 2 [json_name = "imageShortId"];
+  repeated string running_containers = 3 [json_name = "runningContainers"];
+  repeated PackageBrief packages = 4;
+}
+
+message GetPackageEvidenceRequest {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string image_short_id = 2 [json_name = "imageShortId"];
+  string package = 3;                    // 包名，必须和快照里的完全一致
+}
+
+message ProcessUse {
+  string container = 1;
+  int32 pid = 2;
+  string user = 3;
+  string args = 4;
+  string via = 5;                        // lib = 加载了它的库；exe = 进程本身就是它
+  string path = 6;
+}
+
+message GetPackageEvidenceResponse {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string image_short_id = 2 [json_name = "imageShortId"];
+  repeated string repo_tags = 3 [json_name = "repoTags"];
+  repeated PackageBrief packages = 4;    // 同名包可能出现在多个目标里（如多个 Go 程序都带 stdlib）
+  int32 vulns_total = 5 [json_name = "vulnsTotal"];
+  bool truncated = 6;                    // 漏洞太多时只返回一部分，避免撑满 LLM 上下文
+  repeated ProcessUse uses = 7;
+  repeated string running_containers = 8 [json_name = "runningContainers"];
+  string image_user = 9 [json_name = "imageUser"];
+  repeated string entrypoint = 10;
+  repeated string cmd = 11;
+  string evidence_collected_at = 12 [json_name = "evidenceCollectedAt"];
+  string host_kernel = 13 [json_name = "hostKernel"];
+  repeated AgentDriver agents = 14;
+}
+
+message GetCVERequest {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string cve_id = 2 [json_name = "cveId"];
+}
+
+message GetCVEResponse {
+  string snapshot_id = 1 [json_name = "snapshotId"];
+  string id = 2;
+  string title = 3;
+  string description = 4;
+  string cvss_json = 5 [json_name = "cvssJson"];   // 各来源的 CVSS 原样转成 JSON 字符串
+  repeated string cwe = 6;
+  string url = 7;
+  string published = 8;
+}

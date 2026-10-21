@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["snapshotDir"],
+  "properties": {
+    "snapshotDir": {
+      "type": "string",
+      "description": "快照根目录（容器内路径，只读挂载）"
+    },
+    "maxAgeHours": {
+      "type": "number",
+      "minimum": 1,
+      "description": "快照超过这个小时数即标记为过期，默认 26（cron 每天 02:00，留 2 小时余量）"
+    }
+  }
+}

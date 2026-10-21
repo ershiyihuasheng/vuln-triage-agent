@@ -1,0 +1,18 @@
+{
+  "schema": "chaitin.octobus.service.v1",
+  "name": "vulndata",
+  "displayName": "VulndataService",
+  "description": "漏洞快照只读查询：镜像漏洞、运行时证据、CVE 详情。只返回快照里已有的数据，不做研判。",
+  "runtime": {
+    "mode": "on-demand"
+  },
+  "proto": {
+    "roots": [
+      "proto"
+    ],
+    "files": [
+      "proto/vulndata.proto"
+    ]
+  },
+  "configSchema": "config.schema.json"
+}

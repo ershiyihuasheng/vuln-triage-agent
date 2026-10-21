@@ -1,0 +1,6 @@
+# 本项目自定义：daemon 直接调用 LLM（scheduler.llm）的超时。
+# 镜像默认 LLM_TIMEOUT=60s，官方 compose 的 environment 没有透传这个变量，所以在这里补上；值从 .env 读取
+services:
+  agent-compose:
+    environment:
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60s}

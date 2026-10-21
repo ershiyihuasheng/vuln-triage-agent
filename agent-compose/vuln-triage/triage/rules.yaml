@@ -1,0 +1,44 @@
+# 预研判规则：能确定的直接下结论，确定不了的交给 LLM。
+# 每条规则的前提都从快照数据里检查；前提无法确认时规则不生效，交给 LLM。
+# 规则按顺序匹配，第一条命中的生效。
+version: 1
+
+options:
+  # 结论的主语是"这个包上报告的漏洞"：受影响 / 不受影响（附前提条件）/ 待确认
+  # R2 开关：方案 A = "受影响"（宁可多报）；方案 B = "llm"（交给 LLM 细判）
+  in_use_verdict: 受影响
+
+rules:
+  - id: R2
+    name: 正被运行中的进程使用
+    match:
+      usage: [in_use]
+    verdict: "@in_use_verdict"
+    basis: 进程正在加载或运行
+    reason: "运行中的进程加载了该包或正在运行它：{used_via}。运行时证据无法排除"
+
+  - id: R1
+    name: 内核头文件包
+    match:
+      package: [linux-libc-dev]
+    verdict: 不受影响
+    basis: 包内无可执行代码
+    reason: "包内只有内核头文件（实测 1039 个 .h），镜像不含内核；容器使用宿主机内核，内核风险以宿主机内核 {host_kernel} 为准，不在镜像研判范围内"
+
+  - id: R4
+    name: 包内没有可执行代码
+    match:
+      inert: [true]
+    verdict: 不受影响
+    basis: 包内无可执行代码
+    reason: "包内文件全部是文档、手册页、头文件或静态库（依据镜像里的 dpkg 文件清单，按白名单分类），没有可执行程序、共享库或脚本。前提：包内容不变"
+
+  - id: R3
+    name: 仅特定沙箱驱动使用的组件
+    match:
+      package: [qemu-utils]
+    require:
+      all_agent_drivers_in: [docker]
+    verdict: 不受影响
+    basis: 组件仅特定驱动使用
+    reason: "该组件只供 microsandbox/boxlite 驱动使用；当前 agent 驱动为 {drivers}。前提：驱动不变，换驱动后此结论失效"

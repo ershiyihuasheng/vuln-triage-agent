@@ -1,0 +1,73 @@
+# 漏洞适用性研判 Agent 专用项目
+name: vuln-triage
+
+octobus_servers:
+  internal:
+    url: http://octobus:9000
+    token: ${OCTOBUS_DEV_TOKEN}
+
+volumes:
+  triage-work: {}          # 各步骤之间传递中间结果，并保存跨次缓存 /work/cache.json
+
+agents:
+  triager:
+    provider: codex
+    image: chaitin/agent-compose-guest:v2610.1.0
+    driver:
+      docker: {}
+    capset_ids:
+      - internal/triage    # 只能访问 vulndata 的 4 个只读方法
+    workspace:
+      provider: file
+      path: ./triage       # copy 模式：每次运行复制一份进沙箱，沙箱里的修改不会写回
+    volumes:
+      - triage-work:/work
+    scheduler:
+      run_timeout: 6h      # 首次全量实测 2 小时 28 分；之后只研判有变化的包
+      script: |
+        // 编排：确定性脚本在沙箱里跑（经 OctoBus 取数据），LLM 用 scheduler.llm 调用（不建 agent 沙箱，LLM 不能执行命令）
+        // scheduler.shell 遇到非零退出码不会抛异常（骨架实验实测），所以每一步都由 sh() 检查 success
+        const MODELS = ["kimi-k3", "deepseek-v4.1-flash", "qwen3.8-flash", "glm-5.3"];   // 依次尝试，前一个失败（如额度用完）换下一个
+
+        function sh(cmd, opts) {
+          const r = scheduler.shell(`set -euo pipefail; cd /workspace; ${cmd}`, opts || {});
+          if (!r.success) throw new Error(`命令失败 exit=${r.exitCode}: ${cmd}\n${r.stderr}`);
+          return r;
+        }
+
+        function judge(name) {
+          const p = sh(`python3 build_prompts.py --batch ${name} >/dev/null && cat /work/prompts/batch-${name}.txt`);
+          if (p.stdoutTruncated) throw new Error(`批次 ${name} 的证据输出被截断`);
+          const errors = [];
+          for (const model of MODELS) {
+            try {
+              const r = scheduler.llm(p.stdout, { model });
+              sh(`mkdir -p /work/llm && printf '%s' "$OUT" > /work/llm/${name}.txt && printf '%s' "$MODEL" > /work/llm/${name}.model`,
+                 { env: { OUT: r.text, MODEL: model } });
+              return { batch: name, model, finishReason: r.finishReason };
+            } catch (e) {
+              errors.push(`${model}: ${e}`);
+            }
+          }
+          return { batch: name, model: "", errors };   // 全部模型失败：没有输出文件，校验会把整批降级为证据不足
+        }
+
+        function pipeline(payload) {
+          const snap = (payload && payload.snapshot_id) || "";
+          if (snap && !/^\d{8}T\d{6}$/.test(snap)) throw new Error(`snapshot_id 格式不对: ${snap}`);
+          // 只研判部分镜像：payload {"images":["nginx","377409360a3d"]}，按镜像名包含或短 ID 匹配；不传 = 全部
+          const images = (payload && payload.images) || [];
+          if (!Array.isArray(images) || images.some((x) => !/^[A-Za-z0-9._\/:@-]+$/.test(x))) throw new Error("images 参数不合法");
+          const args = (snap ? ` --snapshot-id ${snap}` : "") + (images.length ? ` --images ${images.join(",")}` : "");
+          const pre = sh(`rm -rf /work/llm /work/prompts && python3 pretriage.py --out /work${args}`);
+          const plan = JSON.parse(sh("python3 plan.py --size 8").stdout.trim().split("\n").pop());
+          const llm = plan.batches.map(judge);
+          const stats = JSON.parse(sh("python3 validate.py /work").stdout.trim().split("\n").pop());
+          sh("python3 report.py /work");
+          return { payload: payload || null, pretriage: pre.stdout, plan, llm, stats, report: "/work/report.md" };
+        }
+
+        // 主触发：采集脚本完成后 scheduler trigger triager daily-triage --payload '{"snapshot_id":...}'
+        // 兜底：采集失败没有触发时，03:30 仍会用最新的完整快照跑一次（报告里会标出快照是否过期）
+        scheduler.cron("daily-triage", "30 3 * * *", pipeline, { timezone: "Asia/Shanghai" });
+        function main(payload) { return pipeline(payload); }

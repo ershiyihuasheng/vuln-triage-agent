@@ -1,0 +1,23 @@
+services:
+  octobus:
+    # 固定到 digest：ghcr 上这个镜像 2026-08-07 后已停更，:latest 标签可能被改指向；
+    # 这个 digest 就是当前正在运行的镜像（docker image inspect 的 RepoDigests）
+    image: ghcr.io/chaitin/octobus@sha256:377409360a3d54f8e058340a7fb4874a994f18d11d35ba8f7cae0bec23a724a6
+    container_name: octobus
+    restart: always
+    env_file: .env
+    volumes:
+      - octobus-data:/var/lib/octobus
+      # 漏洞快照：只读挂载，给 vulndata 服务读取；容器内进程无法修改快照
+      - /opt/vuln-agent/snapshots:/snapshots:ro
+    networks:
+      - default
+      - agent-compose
+
+volumes:
+  octobus-data:
+
+networks:
+  agent-compose:
+    name: agent-compose_default
+    external: true
