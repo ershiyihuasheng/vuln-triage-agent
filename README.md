@@ -26,7 +26,7 @@ Trivy 会把镜像里每个"版本命中"的包都报出来，但很多漏洞在
                 │ 只读挂载
 OctoBus 容器 ───▼────────────────────────────────────────────────────────────────
  vulndata 服务：GetSummary / ListPackages / GetPackageEvidence / GetCVE
- 读取前校验 COMPLETE、sha256、快照年龄 ≤ 26h；能力集 triage 只开放这 4 个方法
+ 读取前校验 COMPLETE 和 sha256；超过 26h 的快照标记为过期；能力集 triage 只开放这 4 个方法
                 ▲ gRPC（沙箱 token → capproxy → OctoBus token）
 agent-compose 容器 ──────────────────────────────────────────────────────────────
  项目 vuln-triage / agent triager（docker 沙箱）/ 调度脚本 agent-compose.yml
