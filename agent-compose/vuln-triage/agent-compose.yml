@@ -27,7 +27,7 @@ agents:
       script: |
         // 编排：确定性脚本在沙箱里跑（经 OctoBus 取数据），LLM 用 scheduler.llm 调用（不建 agent 沙箱，LLM 不能执行命令）
         // scheduler.shell 遇到非零退出码不会抛异常（骨架实验实测），所以每一步都由 sh() 检查 success
-        const MODELS = ["kimi-k3", "deepseek-v4.1-flash", "qwen3.8-flash", "glm-5.3"];   // 依次尝试，前一个失败（如额度用完）换下一个
+        const MODELS = ["deepseek-v4.1-flash-1017"];   // 依次尝试，前一个失败（如额度用完）换下一个
 
         function sh(cmd, opts) {
           const r = scheduler.shell(`set -euo pipefail; cd /workspace; ${cmd}`, opts || {});
@@ -40,13 +40,18 @@ agents:
           if (p.stdoutTruncated) throw new Error(`批次 ${name} 的证据输出被截断`);
           const errors = [];
           for (const model of MODELS) {
-            try {
-              const r = scheduler.llm(p.stdout, { model });
+            // 调用报错（如网络中断 connection reset）时没有拿到回答、不计费，同一模型最多再试 2 次
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              let r;
+              try {
+                r = scheduler.llm(p.stdout, { model });
+              } catch (e) {
+                errors.push(`${model} 第${attempt}次: ${e}`);
+                continue;
+              }
               sh(`mkdir -p /work/llm && printf '%s' "$OUT" > /work/llm/${name}.txt && printf '%s' "$MODEL" > /work/llm/${name}.model`,
                  { env: { OUT: r.text, MODEL: model } });
-              return { batch: name, model, finishReason: r.finishReason };
-            } catch (e) {
-              errors.push(`${model}: ${e}`);
+              return { batch: name, model, attempts: attempt, finishReason: r.finishReason, errors };
             }
           }
           return { batch: name, model: "", errors };   // 全部模型失败：没有输出文件，校验会把整批降级为证据不足

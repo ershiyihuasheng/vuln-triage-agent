@@ -7,7 +7,7 @@
 读:  /work/pretriage.json  /work/batches/*.json  /work/llm/<批次>.txt|.model  /work/reused.json
 写:  /work/final.json   并把通过校验的 LLM 结论写进 /work/cache.json
 """
-import glob, json, os, sys
+import glob, json, os, re, sys
 from datetime import datetime, timezone
 
 W = sys.argv[1] if len(sys.argv) > 1 else "/work"
@@ -18,12 +18,25 @@ STATIC_REFS = ("files", "description", "image_cmd", "image_entrypoint", "vulns["
 AFFECT_REFS = ("image_cmd", "image_entrypoint", "used_via", "files")
 
 
-def parse(text):
-    """百炼不支持 JSON Schema 约束（实测），输出可能带代码块标记或说明文字：取第一个 { 到最后一个 }"""
-    i, j = text.find("{"), text.rfind("}")
-    if i < 0 or j <= i:
-        raise ValueError("输出里没有 JSON 对象")
-    return json.loads(text[i:j + 1])
+START = re.compile(r'\{\s*"(?:batch|results)"')
+
+
+def parse(text, batch=None):
+    """百炼不支持 JSON Schema 约束（实测），不同模型输出格式不同：
+    kimi-k3 只输出 JSON；deepseek-v4.1-flash 先输出大段思考过程（其中也有 { 和草稿 JSON），最后才是结果。
+    做法：找出所有以 {"batch" 或 {"results" 开头的位置，从最后一个往前逐个按 JSON 语法解析，
+    取第一个含 results 列表、且 batch 字段（若有）与本批编号一致的对象。"""
+    dec = json.JSONDecoder()
+    for m in reversed(list(START.finditer(text))):
+        try:
+            obj, _ = dec.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("results"), list):
+            if batch and obj.get("batch") not in (None, batch):
+                continue
+            return obj
+    raise ValueError("输出里没有可解析的 results 对象")
 
 
 def infer_basis(verdict, reason, evidence):
@@ -86,7 +99,7 @@ for bpath in sorted(glob.glob(os.path.join(W, "batches", "batch-[0-9]*.json"))):
     mpath = os.path.join(W, "llm", f"{name}.model")
     model = open(mpath).read().strip() if os.path.exists(mpath) else ""
     try:
-        results, err_all = parse(open(os.path.join(W, "llm", f"{name}.txt")).read())["results"], ""
+        results, err_all = parse(open(os.path.join(W, "llm", f"{name}.txt")).read(), name)["results"], ""
     except Exception as e:
         results, err_all = [], f"LLM 输出无法使用：{e}"
         stats["llm_failed_batches"] += 1
