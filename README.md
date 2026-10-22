@@ -1,149 +1,286 @@
-# 镜像漏洞适用性研判 Agent
+# 镜像漏洞适用性研判
 
-Trivy 会把镜像里每个"版本命中"的包都报出来，但很多漏洞在当前环境里根本触发不了。
-本项目基于 agent-compose + OctoBus，每天自动扫描宿主机全部本地镜像，结合**运行时证据**和**包文件清单**，
-对每个有漏洞的包给出结论：
+Trivy 按版本号报漏洞，镜像里只要装了受影响版本的包就会报出来，其中很多漏洞在实际运行环境里触发不了。这个项目每天扫描宿主机上的全部本地镜像，结合容器的运行情况和包里实际装的文件，给每个有漏洞的包一个结论：受影响、不受影响或待确认。判为不受影响的，会写明成立的前提条件。
 
-| 结论（主语：这个包上报告的漏洞） | 含义 | 实例（摘自真实报告） |
-|---|---|---|
-| **受影响** | 漏洞代码会被执行 | nginx 的 libssl3：nginx 进程正在加载 `libssl.so.3`（规则 R2） |
-| **不受影响** | 当前环境触发不了，**必须附前提条件** | gpgv：CVE 只影响 gpgsm，而 gpgv 包文件清单只有 `/usr/bin/gpgv`。前提：清单完整、环境中无其他包提供 gpgsm |
-| **待确认** | 证据不足，需人工确认 | curl：包内有可执行程序，采集时未观察到运行，不能证明服务不会调用 |
-
-同一镜像在服务**启动前后**结论不同（nginx:1.27 实测）：启动前 受影响 1 / 待确认 59 / 不受影响 19；
-启动后 libpcre2-8-0、libssl3、zlib1g 因被 nginx 进程加载，由规则直接判为受影响（4 / 57 / 18）。
-
-选题属于安全技术方向（自拟）：在修复之前回答"这些漏洞里哪些真的需要修"，把修复精力集中到有证据的少数包上。
-
-## 架构
+报告节选（列有删减）：
 
 ```
-宿主机 ──────────────────────────────────────────────────────────────────────────
- cron 02:00 → collector/collect.sh（root）
-   Trivy 扫描 + 运行证据（docker top、/proc/PID/maps）+ 包文件清单（docker create/cp，不运行镜像）
-   → 快照 /opt/vuln-agent/snapshots/<时间>/（manifest sha256 + COMPLETE）
-   → scheduler trigger 通知研判
-                │ 只读挂载
-OctoBus 容器 ───▼────────────────────────────────────────────────────────────────
- vulndata 服务：GetSummary / ListPackages / GetPackageEvidence / GetCVE
- 读取前校验 COMPLETE 和 sha256；超过 26h 的快照标记为过期；能力集 triage 只开放这 4 个方法
-                ▲ gRPC（沙箱 token → capproxy → OctoBus token）
-agent-compose 容器 ──────────────────────────────────────────────────────────────
- 项目 vuln-triage / agent triager（docker 沙箱）/ 调度脚本 agent-compose.yml
-   pretriage.py   经 OctoBus 取数，规则 R1–R4 先判
-   plan.py        证据未变 → 沿用缓存；其余每 8 个包一批
-   scheduler.llm  每批一次大模型调用（daemon 直接请求，大模型不能执行命令）
-   validate.py    校验大模型结论，不合格降为"待确认"
-   report.py      报告 → /opt/vuln-agent/reports/<快照>.md
+| 包         | 结论     | 说明                                                                 | 来源       |
+|------------|----------|----------------------------------------------------------------------|------------|
+| libssl3t64 | 受影响   | 运行中的进程加载了 /usr/lib/x86_64-linux-gnu/libssl.so.3             | 规则 R2    |
+| gpgv       | 不受影响 | CVE 只涉及 gpgsm 的 CMS 解析，gpgv 包里只有 /usr/bin/gpgv            | 大模型     |
+| curl       | 待确认   | 包里有 /usr/bin/curl，采集时没有看到它运行，不能证明服务不会调用它   | 大模型     |
 ```
 
-| 组件 | 职责 | 为什么这样分 |
+## 工作原理
+
+```
+宿主机
+  cron 02:00 ─> collector/collect.sh
+                 Trivy 扫描、采集容器进程和加载的库、读取包文件清单
+                 写入快照 /opt/vuln-agent/snapshots/<时间>/
+                 完成后通知 agent-compose 开始研判
+                        │ 只读挂载
+OctoBus                 ▼
+  vulndata 服务：GetSummary / ListPackages / GetPackageEvidence / GetCVE
+  能力集 triage 只开放这 4 个方法
+                        ▲ gRPC
+agent-compose           │
+  研判沙箱：pretriage.py ─> plan.py ─> build_prompts.py ─> validate.py ─> report.py
+  scheduler.llm：由 daemon 调用大模型
+```
+
+采集放在宿主机上，因为读取容器进程、调用 Docker 和 Trivy 都需要 root 权限。每次采集生成一份快照，所有文件写完后才创建 `COMPLETE` 标记，每个文件的 sha256 记录在 `manifest.json` 里。
+
+研判在 agent-compose 的沙箱里进行。沙箱不能直接读快照，只能通过 OctoBus 上的 vulndata 服务查询。vulndata 读文件前会核对 `COMPLETE` 和 sha256，能力集 triage 只开放 4 个只读方法，OctoBus 的访问凭据由 agent-compose daemon 持有，沙箱拿不到。每次调用都记录在 OctoBus 的访问日志里。
+
+研判按以下顺序进行：规则能判断的直接给结论；证据和上次相同的沿用上次结论；剩下的每 8 个包一批交给大模型；大模型的结论经过校验后才写进报告。大模型通过 `scheduler.llm` 调用，由 daemon 直接发请求，模型只收到证据文字、返回结论文字，不能执行命令。
+
+## 研判逻辑
+
+### 规则
+
+规则写在 `agent-compose/vuln-triage/triage/rules.yaml`，由 `pretriage.py` 按文件中的顺序匹配，命中一条即停止：
+
+| 规则 | 条件 | 结论 |
 |---|---|---|
-| 宿主机 collect.sh | 采集（需要 root） | 高权限操作不进沙箱 |
-| OctoBus | 把快照作为只读能力对外提供；鉴权、限定方法、记录调用 | 沙箱拿不到真实凭据，也不能绕过网关读数据 |
-| agent-compose | 定时/事件触发、沙箱、大模型调用、运行记录 | 编排与执行环境 |
+| R2 | 运行中的进程加载了包里的库，或者正在运行包里的程序 | 受影响 |
+| R1 | 包名是 linux-libc-dev | 不受影响 |
+| R4 | 包里的文件全部是文档、手册、头文件或静态库 | 不受影响 |
+| R3 | 包名是 qemu-utils，并且所有 agent 都使用 docker 驱动 | 不受影响 |
 
-**脚本与大模型分工**：取数、规则、缓存、校验、出报告全部由代码完成；大模型只判断"漏洞代码在不在这个包里、会不会被用到"这类模糊问题。
+R2 排在最前面，保证有进程在使用的包不会被后面的规则判为不受影响。四条规则都不命中的包交给大模型。
 
-## 闭环
+### 缓存
 
-| 环节 | 实现 |
-|---|---|
-| 触发 | 宿主机 cron 02:00 采集，完成后 `scheduler trigger`；agent-compose 自身 `scheduler.cron` 03:30 兜底 |
-| 取数 | 沙箱经 OctoBus 调用 vulndata |
-| 判定 | 规则 → 大模型 → 校验 |
-| 产出 | Markdown 报告：结论、依据类型、说明、前提条件、主要 CVE 与修复版本、来源 |
-| 留痕 | 快照 manifest；OctoBus 访问日志；agent-compose 运行记录；报告"来源"列（规则编号 / 大模型 / 缓存） |
+`plan.py` 用镜像、包名、版本、包路径、漏洞列表、运行状态和文件分类组成缓存键。这些都没变的包直接沿用上次的结论，任何一项变化都会重新研判。
 
-## 知识与判据
+### 大模型与校验
 
-代码中实际使用的判据（规则见 `agent-compose/vuln-triage/triage/rules.yaml`）：
+`build_prompts.py` 通过 OctoBus 取出每个包的文件清单、使用它的进程、镜像启动命令和漏洞描述，连同 `judge_prompt.md` 拼成提示词。`validate.py` 检查大模型的回答：结论必须是规定的几种之一，引用的证据必须存在，判为不受影响的必须写出前提条件。不符合的改为待确认，并记录原因。
 
-| 判据 | 依据 | 位置 |
-|---|---|---|
-| 进程加载了包内的库或运行包内程序 → 受影响 | 代码已在内存中执行；只做包级，宁可多报 | 规则 R2 |
-| linux-libc-dev → 不受影响 | 只有内核头文件（实测 1039 个 .h），容器使用宿主机内核 | 规则 R1 |
-| 包内文件全是文档/头文件/静态库 → 不受影响 | **白名单**分类，认不出的文件一律视为可执行 | 规则 R4、pkgfiles.py |
-| qemu-utils 且所有 agent 驱动均为 docker → 不受影响 | 只供 microsandbox/boxlite 驱动使用；换驱动即失效 | 规则 R3 |
-| **"采集时未观察到"不能判不受影响** | git、curl、dash 等按需调用的工具平时不在进程表里 | 无对应排除规则，交大模型；validate.py |
-| Go 程序按进程 exe 判断，不看 .so | Go 静态二进制不加载 .so，按库判断会漏报 | evidence.py、snapshot.js |
-| 路径统一到 /usr | Ubuntu `/lib` 是 `usr/lib` 的链接，不统一会漏报"受影响" | evidence.py |
-| 同名包按"包路径 + 扫描目标"区分 | node 的同名包出现在多个路径，按包名会混淆证据 | plan.py |
-| CVSS、"暂无修复版本"、镜像标签不作为适用性依据 | 严重度不等于可触发；标签可变，一律用镜像 ID | rules.yaml、collect.sh |
-| 大模型结论必须核对：引用的证据须存在，"不受影响"须有前提 | 大模型会出错、会波动 | validate.py |
+### 判断依据
+
+- 采集时没有看到进程使用，不能作为不受影响的依据。git、curl、dash 这类工具平时不在进程列表里，服务随时可能临时调用它们。所以没有对应的排除规则，这类包交给大模型，大模型判断不了就是待确认。
+- Go 程序把依赖编译进可执行文件，运行时不加载 .so（在 octobus 主程序上确认过）。按加载的库判断会漏掉 Go 依赖，所以 Go 程序改为判断进程的可执行文件是不是它（`collector/evidence.py`、`octobus/vulndata/src/snapshot.js`）。
+- Ubuntu 的 /lib 是指向 /usr/lib 的链接。/proc/PID/maps 里的路径和 dpkg 文件清单里的写法可能不同，不统一就对不上包，会漏判受影响。采集时把路径统一到 /usr（`evidence.py`）。
+- linux-libc-dev 里只有内核头文件，Trivy 会把内核漏洞报在这个包上。容器使用宿主机内核，这类漏洞应该按宿主机内核版本判断，不属于镜像的问题（R1）。
+- agent-compose 镜像里的 qemu-utils 只有 microsandbox、boxlite 这类虚拟机驱动会用到，使用 docker 驱动时不会执行。换驱动后这条结论失效（R3）。
+- 判断包里是否只有不可执行文件时用白名单：只有确认是文档、头文件、静态库的才算，认不出的文件一律当作可执行（`collector/pkgfiles.py`、R4）。
+- 同一个镜像里可能有多个同名的 node 包，分别装在不同路径下。只按包名区分会把它们的证据混在一起，所以包的标识里加上了路径和扫描目标（`plan.py`）。
+- CVSS 评分、有没有修复版本都不用来判断能否触发。镜像一律按 ID 识别，不按标签。
 
 ## 部署
 
-前置：Docker、agent-compose v2610.1.0（`/opt/agent-compose`）、Trivy 0.76.0。token 只通过文件 / `--token-stdin` / `.env` 传递，不入库。
+需要 Docker、agent-compose v2610.1.0（部署在 `/opt/agent-compose`）和 Trivy 0.76.0。凭据通过文件、`--token-stdin` 或 `.env` 传入，不进入仓库。以下命令在仓库根目录执行。
+
+1. 部署 OctoBus。compose 文件里没有发布端口，容器只加入 `agent-compose_default` 网络，快照目录以只读方式挂载到 `/snapshots`。
+
+   ```bash
+   mkdir -p /opt/octobus && cp octobus/docker-compose.yml /opt/octobus/
+   (cd /opt/octobus && docker compose up -d)
+   ```
+
+2. 导入 vulndata 服务，创建实例，在能力集 triage 里选中 4 个方法。能力集的创建按 OctoBus 官方文档操作；管理员 token 和能力集 token 用同一个密钥，原因见排错记录「agent-compose 连接 OctoBus 只能配一个 token」。
+
+   ```bash
+   A="-e OCTOBUS_ADMIN_TOKEN=$(cat /opt/octobus/admin.token)"
+   docker cp octobus/vulndata octobus:/tmp/vulndata-build
+   docker exec -u 0 octobus chown -R octobus:octobus /tmp/vulndata-build
+   docker exec $A octobus octobus service import vulndata /tmp/vulndata-build
+   docker exec $A octobus octobus instance create vulndata-prod --service vulndata \
+     --config-json '{"snapshotDir":"/snapshots","maxAgeHours":26}'
+   docker exec $A octobus octobus capset add-instance triage vulndata-prod --no-all-methods
+   for m in GetSummary ListPackages GetPackageEvidence GetCVE; do
+     docker exec $A octobus octobus capset select-method triage vulndata-prod vulndata.v1.VulndataService/$m
+   done
+   ```
+
+3. 安装采集脚本和定时任务，手动运行一次生成第一份快照。
+
+   ```bash
+   mkdir -p /opt/vuln-agent && cp -r collector /opt/vuln-agent/
+   cp collector/cron.vuln-collect /etc/cron.d/vuln-collect
+   /opt/vuln-agent/collector/collect.sh
+   ```
+
+4. 调大 agent-compose 的大模型超时时间（原因见排错记录第一条）。
+
+   ```bash
+   cp agent-compose/docker-compose.override.yml /opt/agent-compose/
+   # 在 /opt/agent-compose/.env 中设置：
+   #   COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
+   #   LLM_TIMEOUT=600s
+   (cd /opt/agent-compose && docker compose up -d)
+   ```
+
+5. 部署研判项目。`.env` 中填入 `OCTOBUS_DEV_TOKEN`。
+
+   ```bash
+   cp -r agent-compose/vuln-triage /opt/agent-compose/data/work/
+   cp agent-compose/vuln-triage/.env.example /opt/agent-compose/data/work/vuln-triage/.env
+   docker exec -w /data/work/vuln-triage agent-compose agent-compose up
+   ```
+
+## 使用
+
+每天 02:00 自动采集，采集完成后自动研判。agent-compose 的调度器在 03:30 还有一次定时触发，用于采集没能触发研判时补跑；同一时间只会有一次研判在运行。
+
+手动研判：
 
 ```bash
-# 以下在仓库根目录执行
-# 1. OctoBus（compose 中不发布端口，仅加入 agent-compose_default 网络）
-mkdir -p /opt/octobus && cp octobus/docker-compose.yml /opt/octobus/
-(cd /opt/octobus && docker compose up -d)
-A="-e OCTOBUS_ADMIN_TOKEN=$(cat /opt/octobus/admin.token)"
-docker cp octobus/vulndata octobus:/tmp/vulndata-build
-docker exec -u 0 octobus chown -R octobus:octobus /tmp/vulndata-build
-docker exec $A octobus octobus service import vulndata /tmp/vulndata-build
-docker exec $A octobus octobus instance create vulndata-prod --service vulndata \
-  --config-json '{"snapshotDir":"/snapshots","maxAgeHours":26}'
-docker exec $A octobus octobus capset add-instance triage vulndata-prod --no-all-methods
-for m in GetSummary ListPackages GetPackageEvidence GetCVE; do
-  docker exec $A octobus octobus capset select-method triage vulndata-prod vulndata.v1.VulndataService/$m
-done
-#    能力集 triage 的创建与 token 绑定按 OctoBus 官方文档执行
+AC="docker exec -w /data/work/vuln-triage agent-compose agent-compose"
 
-# 2. 采集
-mkdir -p /opt/vuln-agent && cp -r collector /opt/vuln-agent/
-cp collector/cron.vuln-collect /etc/cron.d/vuln-collect
-/opt/vuln-agent/collector/collect.sh
-
-# 3. agent-compose（大模型超时调到 600s，见"问题与处理"第 1 条）
-cp agent-compose/docker-compose.override.yml /opt/agent-compose/
-#    /opt/agent-compose/.env：COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml、LLM_TIMEOUT=600s
-(cd /opt/agent-compose && docker compose up -d)
-cp -r agent-compose/vuln-triage /opt/agent-compose/data/work/
-cp agent-compose/vuln-triage/.env.example /opt/agent-compose/data/work/vuln-triage/.env   # 填入 OCTOBUS_DEV_TOKEN
-docker exec -w /data/work/vuln-triage agent-compose agent-compose up
+# 研判最新的快照
+$AC scheduler trigger triager daily-triage --payload '{"reason":"manual"}' --detach
+# 指定快照
+$AC scheduler trigger triager daily-triage --payload '{"snapshot_id":"20261022T165114"}' --detach
+# 只研判部分镜像，按镜像名包含或短 ID 匹配
+$AC scheduler trigger triager daily-triage --payload '{"images":["nginx"]}' --detach
 ```
 
-## 登录与核验
+查看运行结果（需要完整的运行 ID）：
+
+```bash
+$AC scheduler runs triager
+$AC inspect run <运行ID>
+```
+
+报告在 `/opt/vuln-agent/reports/<快照编号>.md`。
+
+使用的模型在 `agent-compose.yml` 的 `MODELS` 里配置，修改后执行 `agent-compose up` 生效。
+
+## 运行环境
 
 | 地址 | 用户名 | 端口 |
 |---|---|---|
 | `<公网IP>` | root | 22 |
 
+公网只开放 22 端口。agent-compose 控制面绑定在 `127.0.0.1:7410`；OctoBus 没有发布端口；两个容器的重启策略都是 `always`。
+
+核验命令：
+
 ```bash
 AC="docker exec -w /data/work/vuln-triage agent-compose agent-compose"
 A="-e OCTOBUS_ADMIN_TOKEN=$(cat /opt/octobus/admin.token)"
 
-docker exec agent-compose agent-compose version; docker exec agent-compose agent-compose project ls
-$AC scheduler inspect triager; $AC scheduler runs triager          # 触发器与运行记录
+docker exec agent-compose agent-compose version
+docker exec agent-compose agent-compose project ls
+$AC scheduler inspect triager
+$AC scheduler runs triager
 docker exec $A octobus octobus status
-docker exec $A octobus octobus capset list-methods triage          # 暴露的方法
-docker exec $A octobus octobus logs --capset triage --tail 20      # 调用审计日志
-ls /opt/vuln-agent/reports/                                        # 报告
-
-# 手动研判（可只研判部分镜像）
-$AC scheduler trigger triager daily-triage --payload '{"reason":"manual","images":["nginx"]}' --detach
+docker exec $A octobus octobus capset list-methods triage
+docker exec $A octobus octobus logs --capset triage --tail 20
+ls /opt/vuln-agent/reports/
 ```
 
-暴露面：公网只开放 22；agent-compose 控制面绑定 `127.0.0.1:7410`；OctoBus 未发布端口；两个容器 `restart: always`。
+## 排错记录
 
-## 问题与处理
+### 导入 OctoBus 示例服务时报 `repo root with sdk package not found`
 
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| 大模型调用 60 秒超时 | daemon 读环境变量 `LLM_TIMEOUT`；官方 `.env` 的 `COMPOSE_FILE` 阻止加载 override 文件 | override 传入 600s，并加入 `COMPOSE_FILE` |
-| agent 方式下大模型用 curl 从外网下载 .deb "查证" | 提示词禁令不是强制约束 | 改为脚本经 OctoBus 预取证据 + `scheduler.llm` 只传文字，大模型无法执行命令；token 消耗同时下降一个数量级 |
-| 命令失败但运行显示成功 | `scheduler.shell` 非零退出不抛异常 | 封装 `sh()` 检查 `success`，脚本 `set -euo pipefail` |
-| 换用 deepseek 后 7 批结论全部作废 | 该模型先输出思考过程再输出 JSON，原解析方法截错位置 | 按 JSON 语法从最后一个结果对象解析，并核对批次编号；用真实输出验证 |
-| 一批因网络中断（connection reset）失败 | 单次调用无重试 | 调用报错时同一模型重试 2 次（报错不计费，解析失败不重试） |
-| Trivy 按镜像 ID 扫描时访问远程仓库 | 默认按 docker、containerd、podman、remote 顺序查找 | `--image-src docker` |
+部署后用官方的 calculator 示例验证 OctoBus，导入一直失败，报 `repo root with sdk package not found`。修改依赖、离线安装、预先装好 SDK 都没有用。
+
+在 OctoBus 源码里搜这句报错，位置在 `internal/packageimport/importer.go`。这里有一份写死的示例包名单（`octobus-calculator-js` 等 3 个），服务包 `package.json` 里的 `name` 命中名单时，导入会改走一条给源码仓库使用的分支：从当前目录往上找同时含有 `go.mod` 和 `sdk/package.json` 的目录，把仓库里的 SDK 复制过来。我们用的是发布镜像，容器里没有源码仓库，所以一定失败。
+
+把示例 `package.json` 里的 `name` 改成名单以外的名字后，导入正常，OctoBus 会自己从 npm 安装 SDK。
+
+### OctoBus 管理接口没有鉴权
+
+首次启动时按文档设置了 `OCTOBUS_BOOTSTRAP_ADMIN_TOKEN`，但不带 token、或者带错误的 token 执行 `octobus service list` 都能成功。
+
+查源码发现，管理接口要不要校验 token，取决于数据库的 `admin_tokens` 表里有没有记录：表是空的，就整个跳过校验。而启动时设置的 bootstrap token 并没有写进这张表。
+
+用 `octobus admin-token add` 显式添加一条管理员 token 后，不带 token 或 token 错误都返回 401。能力集也有同样的情况：没有添加 token 的能力集，调用入口是公开的，所以能力集也都添加了 token。
+
+### agent-compose 连接 OctoBus 只能配一个 token
+
+`agent-compose.yml` 的 `octobus_servers` 里只有一个 `token` 字段。agent-compose 用它做两件事：读取 OctoBus 管理接口上的能力集信息，以及转发沙箱的能力调用。OctoBus 这两类接口认的是不同的 token，前者要管理员 token，后者要能力集 token。官方对接文档写的是填能力集 token，这在管理接口没有鉴权时可行；给管理接口加了 token 之后，读取能力集信息就会被拒绝。
+
+解决办法是生成一个密钥，同时注册为管理员 token（`octobus admin-token add`）和能力集 token（`octobus capset add-token`），`agent-compose.yml` 里引用这一个。这个密钥只保存在服务器上的 token 文件和 `.env` 里，合并后没有扩大暴露范围。
+
+### 大模型调用 60 秒超时
+
+每批研判都在 60 秒左右失败，运行记录里是 `scheduler.llm` 超时。一批 8 个包，模型实际需要 3 到 5 分钟。
+
+daemon 的超时时间来自环境变量 `LLM_TIMEOUT`，默认 60s，镜像里也写了这个默认值。直接在 `/opt/agent-compose/.env` 里加变量没有效果，因为官方 compose 里的 `env_file` 只给 UI 服务使用。改用 override 文件传给 daemon 后仍然不生效，原因是 `.env` 里有 `COMPOSE_FILE=docker-compose.yml`，它会让 compose 不再自动加载 override 文件。
+
+解决办法是新建 `docker-compose.override.yml`：
+
+```yaml
+services:
+  agent-compose:
+    environment:
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60s}
+```
+
+并修改 `/opt/agent-compose/.env`：
+
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
+LLM_TIMEOUT=600s
+```
+
+执行 `docker compose up -d` 重建容器，`docker exec agent-compose printenv LLM_TIMEOUT` 输出 `600s` 即生效。
+
+### 大模型在沙箱里联网下载文件
+
+最初的做法是让 agent 在沙箱里自己查证据、自己下结论。测试中有一次，模型为了确认某个包里有哪些文件，用 curl 从 archive.ubuntu.com 下载了 .deb 包，而提示词里明确禁止了联网。
+
+提示词里的禁止只是建议，模型不一定遵守。docker 驱动的沙箱加入了 daemon 所在的网络，可以访问外网，agent-compose.yml 里没有限制出网的选项。另外，agent 每查一次都会重发全部上下文，token 消耗也很高。
+
+改为由脚本通过 OctoBus 取好证据，再用 `scheduler.llm` 把证据文字发给模型。`scheduler.llm` 由 daemon 直接请求模型，不启动 agent，模型手里没有可以执行的命令。
+
+### 研判脚本出错，整次运行仍显示成功
+
+调度脚本通过 `scheduler.shell` 在沙箱里依次运行 pretriage.py、plan.py 等脚本。搭建时做过测试：被运行的脚本出错退出后，`scheduler.shell` 不会报错，只是在返回结果里把 `success` 标为 false。调度脚本如果不检查这个值，就会接着执行下一步，最后整次运行仍显示成功。比如 pretriage.py 取数失败，后面的步骤会拿着空数据继续跑，生成一份几乎为空的报告，而运行记录里看不出任何问题。
+
+调度脚本里因此写了一个 `sh()` 函数，所有命令都经它执行。它在执行后检查 `success`，为 false 就抛出错误，让整次运行标记为失败，错误信息里带上出错的命令和输出。它还在每条命令前加上 `set -euo pipefail`：一条命令由多步组成时（比如先生成文件再读取），其中任何一步出错，整条命令都算失败。
+
+### 换模型后整批结论无法解析
+
+调度脚本从原来的模型切换到 deepseek-v4.1-flash 后，7 批结论全部无法解析，53 个包变成了待确认。
+
+查看 `/work/llm/` 下保存的模型回答，每批有 40 到 100KB，开头是一大段英文分析，最后才是 JSON 结果。原来的解析方法取第一个 `{` 到最后一个 `}` 之间的内容，而分析文字里本身就有 `{`，截出来的不是合法的 JSON。
+
+`validate.py` 改为：找出所有以 `{"batch"` 或 `{"results"` 开头的位置，从最后一个往前逐个按 JSON 语法解析，取第一个包含 `results` 并且批次编号一致的对象。改完后先用这 7 批实际的回答验证，7 批都能正确解析出每个包的结论。现在固定使用一个模型，不再自动切换。
+
+### 一批调用因连接中断失败
+
+一次运行中有一批报错 `connection reset by peer`，请求还没收到回答连接就断了，这一批的 8 个包被改为待确认。
+
+`judge` 函数里加了重试：调用报错时同一个模型最多再试 2 次。只有调用报错才重试，这时没有收到回答，不会产生费用；回答收到了但解析不了，不重试。
+
+### Trivy 按镜像 ID 扫描时会去访问远程仓库
+
+Trivy 默认按 docker、containerd、podman、远程仓库的顺序查找镜像。用镜像 ID 扫描时，如果前几种来源没找到，它会拿这个 ID 去远程仓库查找，扫到的不一定是本机的镜像。
+
+`collect.sh` 里扫描时加上 `--image-src docker`，只从本机 Docker 读取镜像。
 
 ## 已知限制
 
-- 包级结论：不分析具体函数是否被调用；"采集时未观察到"的包多数落在"待确认"。
-- 大模型结论有波动：证据变化后重判，结论可能不同（实测 libkrb5support0 由"不受影响"变为"待确认"，方向保守）。
-- 研判沙箱可访问外网（docker 驱动加入 daemon 网络，yml 无限制选项）；同网络内可连到 OctoBus 9000 端口，依靠 token 鉴权拦截。
-- 大模型判出的"不受影响"，"依据类型"由理由文字推断，报告中标"（推断）"。
+- 结论是包级别的，只判断漏洞代码是否在包里、包是否被加载，不分析具体函数有没有被调用。采集时没有看到使用的包，大多数会落在待确认。
+- 证据变化后会重新交给大模型，结论可能和上次不同。
+- 研判沙箱可以访问外网；同一个 Docker 网络里的沙箱能连到 OctoBus 的 9000 端口，目前靠 token 鉴权拦截。
+- 大模型判为不受影响的，报告中「依据类型」一列是按理由文字归类的，标有「（推断）」。
+
+## 目录结构
+
+```
+collector/            宿主机采集脚本，部署到 /opt/vuln-agent/collector/
+  collect.sh          采集主流程
+  discover.py         整理镜像清单
+  evidence.py         采集容器进程和加载的库
+  normalize.py        整理 Trivy 结果
+  pkgfiles.py         读取并分类包文件清单
+  manifest.py         记录快照文件的 sha256
+  cron.vuln-collect   定时任务，复制到 /etc/cron.d/
+octobus/
+  docker-compose.yml  OctoBus 部署
+  vulndata/           vulndata 服务（proto、实现、单元测试）
+agent-compose/
+  docker-compose.override.yml   传入 LLM_TIMEOUT
+  vuln-triage/
+    agent-compose.yml           研判项目：agent、能力集、卷、调度脚本
+    .env.example
+    triage/                     沙箱里运行的研判脚本、规则和提示词
+```
