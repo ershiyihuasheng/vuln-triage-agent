@@ -35,7 +35,7 @@ L = ["# 镜像漏洞适用性研判报告", "",
      f"- 研判范围：{', '.join(m.get('images_filter') or []) or '全部镜像'}",
      f"- 合计 {len(rs)} 个有漏洞的包：受影响 {total['受影响']}，待确认 {total['待确认']}，不受影响 {total['不受影响']}",
      f"- 结论来源：规则 {s['rule']}，沿用缓存 {s['cache']}，LLM {s['llm']}，LLM 结论被校验降级 {s['downgraded']}，LLM 失败批次 {s['llm_failed_batches']}",
-     "- 依据类型标“（推断）”的，是从 LLM 理由文字推断的分类；规则结论的依据类型是确定的", ""]
+     "- 依据类型：规则结论写规则的依据；大模型结论写“大模型判断”，具体依据见说明列；“校验未通过”表示大模型结论没有通过校验，已改为待确认", ""]
 by_img = collections.defaultdict(list)
 for r in rs:
     by_img[(r["image"], tuple(r.get("repo_tags", [])))].append(r)

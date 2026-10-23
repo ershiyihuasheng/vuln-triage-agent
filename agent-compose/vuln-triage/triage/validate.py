@@ -3,7 +3,7 @@
 - 不合格的结论一律降级为"待确认"，并记录降级原因。
 - 结论统一换成以"这个包上报告的漏洞"为主语的说法：受影响 / 不受影响 / 待确认。
   LLM 仍按已验证的提示词输出旧说法（正在使用/用不到/证据不足），在这里换名；
-  依据类型：规则结论来自规则本身；LLM 结论从理由文字推断，并标注"（推断）"。
+  依据类型：规则结论来自规则本身；LLM 结论统一写"大模型判断"，依据见理由；未通过校验的写"校验未通过"。
 读:  /work/pretriage.json  /work/batches/*.json  /work/llm/<批次>.txt|.model  /work/reused.json
 写:  /work/final.json   并把通过校验的 LLM 结论写进 /work/cache.json
 """
@@ -39,17 +39,7 @@ def parse(text, batch=None):
     raise ValueError("输出里没有可解析的 results 对象")
 
 
-def infer_basis(verdict, reason, evidence):
-    t = reason + " " + " ".join(str(x) for x in evidence)
-    if verdict == "受影响":
-        return "启动命令直接运行（推断）" if any(k in t for k in ("image_cmd", "image_entrypoint", "启动命令")) else "会被运行（推断）"
-    if verdict == "不受影响":
-        if any(k in t for k in ("头文件", "无可执行", "没有可执行", "只含文档", "仅含文档", "纯编译期")):
-            return "包内无可执行代码（推断）"
-        if any(k in t for k in ("不在本包", "不在该包", "不在这个包", "不含", "没有", "只有", "仅有", "只提供", "仅提供", "不包含")):
-            return "漏洞代码不在本包（推断）"
-        return "触发条件不满足（推断）"
-    return "证据不足"
+LLM_BASIS = "大模型判断"   # 不按关键词给大模型结论分类，依据看理由（reason）
 
 
 def check(r):
@@ -89,7 +79,7 @@ for r in pre["results"]:
 
 for r in json.load(open(os.path.join(W, "reused.json"))):
     v = NEW.get(r["verdict"], r["verdict"])
-    final.append({**base(r), "verdict": v, "basis": r.get("basis") or infer_basis(v, r.get("reason", ""), r.get("evidence", [])),
+    final.append({**base(r), "verdict": v, "basis": LLM_BASIS,
                   "reason": r.get("reason", ""), "conditions": r.get("conditions", []), "evidence": r.get("evidence", []),
                   "model": r.get("model", ""), "source": r.get("source", "缓存")})
     stats["cache"] += 1
@@ -111,14 +101,14 @@ for bpath in sorted(glob.glob(os.path.join(W, "batches", "batch-[0-9]*.json"))):
         problem = err_all or ("没有对应的结论" if not got else "同一个包给了多条结论" if len(got) > 1 else check(got[0]))
         src = f"LLM（{model}）"
         if problem:
-            final.append({**base(p), "verdict": "待确认", "basis": "证据不足", "reason": f"LLM 结论未通过校验：{problem}",
+            final.append({**base(p), "verdict": "待确认", "basis": "校验未通过", "reason": f"LLM 结论未通过校验：{problem}",
                           "llm_verdict": got[0].get("verdict") if got else "", "llm_reason": got[0].get("reason", "") if got else "",
                           "conditions": [], "evidence": [], "model": model, "source": src, "downgraded": True})
             stats["downgraded"] += 1
             continue
         r = got[0]
         v = NEW[r["verdict"]]
-        rec = {**base(p), "verdict": v, "basis": infer_basis(v, r["reason"], r.get("evidence", [])), "reason": r["reason"],
+        rec = {**base(p), "verdict": v, "basis": LLM_BASIS, "reason": r["reason"],
                "evidence": r.get("evidence", []), "conditions": r.get("conditions", []),
                "missing_evidence": r.get("missing_evidence", []), "model": model, "source": src}
         final.append(rec); stats["llm"] += 1
