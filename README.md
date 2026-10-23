@@ -265,21 +265,32 @@ Trivy 默认按 docker、containerd、podman、远程仓库的顺序查找镜像
 ## 目录结构
 
 ```
-collector/            宿主机采集脚本，部署到 /opt/vuln-agent/collector/
-  collect.sh          采集主流程
-  discover.py         整理镜像清单
-  evidence.py         采集容器进程和加载的库
-  normalize.py        整理 Trivy 结果
-  pkgfiles.py         读取并分类包文件清单
-  manifest.py         记录快照文件的 sha256
-  cron.vuln-collect   定时任务，复制到 /etc/cron.d/
+collector/                     采集脚本
+├── collect.sh                 主流程，依次调用下面几个脚本
+├── discover.py                镜像清单
+├── evidence.py                容器进程和加载的库
+├── normalize.py               整理 Trivy 结果
+├── pkgfiles.py                包文件清单
+├── manifest.py                文件 sha256
+└── cron.vuln-collect          定时任务
 octobus/
-  docker-compose.yml  OctoBus 部署
-  vulndata/           vulndata 服务（proto、实现、单元测试）
+├── docker-compose.yml
+└── vulndata/                  vulndata 服务（proto、实现、单元测试）
 agent-compose/
-  docker-compose.override.yml   传入 LLM_TIMEOUT
-  vuln-triage/
-    agent-compose.yml           研判项目：agent、能力集、卷、调度脚本
-    .env.example
-    triage/                     沙箱里运行的研判脚本、规则和提示词
+├── docker-compose.override.yml   传入 LLM_TIMEOUT
+└── vuln-triage/                  研判项目
+    ├── agent-compose.yml         agent、能力集、卷、调度脚本
+    ├── .env.example
+    └── triage/                   规则、研判脚本、提示词
 ```
+
+部署到服务器上的位置：
+
+| 仓库目录 | 服务器目录 |
+|---|---|
+| `collector/` | `/opt/vuln-agent/collector/`（cron.vuln-collect 放到 `/etc/cron.d/vuln-collect`） |
+| `octobus/` | `/opt/octobus/`；vulndata 源码在 `/opt/vuln-agent/octobus/vulndata/` |
+| `agent-compose/docker-compose.override.yml` | `/opt/agent-compose/` |
+| `agent-compose/vuln-triage/` | `/opt/agent-compose/data/work/vuln-triage/`（daemon 容器内为 `/data/work/vuln-triage`） |
+
+运行数据：快照在 `/opt/vuln-agent/snapshots/`，报告在 `/opt/vuln-agent/reports/`，采集日志在 `/var/log/vuln-collect.log`。
